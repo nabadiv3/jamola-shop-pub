@@ -1,10 +1,15 @@
 import "dotenv/config";
 
 import express from "express";
+
 import cors from "cors";
+
 import mongoose from "mongoose";
+
 import bcrypt from "bcryptjs";
+
 import jwt from "jsonwebtoken";
+
 import { rateLimit } from "express-rate-limit";
 
 import { User, Product, Order } from "./models.js";
@@ -12,7 +17,9 @@ import { User, Product, Order } from "./models.js";
 const app = express();
 
 const PORT = Number(process.env.PORT) || 5000;
+
 const TOKEN_ISSUER = "jamola-server";
+
 const TOKEN_AUDIENCE = "jamola-client";
 
 /* Environment */
@@ -32,8 +39,11 @@ if (
 const allowedOrigins = (
   process.env.CLIENT_ORIGINS || "http://localhost:5173,http://localhost:5174"
 )
+
   .split(",")
+
   .map((origin) => origin.trim())
+
   .filter(Boolean);
 
 /* Middleware */
@@ -43,7 +53,9 @@ app.disable("x-powered-by");
 app.use(
   cors({
     origin: allowedOrigins,
+
     methods: ["GET", "POST", "PATCH", "DELETE"],
+
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
@@ -52,9 +64,13 @@ app.use(express.json({ limit: "100kb" }));
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
+
   limit: 30,
+
   standardHeaders: true,
+
   legacyHeaders: false,
+
   message: {
     message: "Too many attempts. Please try again later.",
   },
@@ -64,7 +80,9 @@ const authLimiter = rateLimit({
 
 function fail(status, message) {
   const error = new Error(message);
+
   error.status = status;
+
   throw error;
 }
 
@@ -79,8 +97,11 @@ function validId(value) {
 function safeUser(user) {
   return {
     id: user._id.toString(),
+
     name: user.name,
+
     email: user.email,
+
     role: user.role,
   };
 }
@@ -93,6 +114,7 @@ function productResponse(product) {
 
   return {
     ...fields,
+
     id: _id.toString(),
   };
 }
@@ -104,6 +126,7 @@ function orderResponse(order) {
 
   return {
     ...fields,
+
     id: _id.toString(),
   };
 }
@@ -111,9 +134,13 @@ function orderResponse(order) {
 function createToken(user) {
   return jwt.sign({}, process.env.JWT_SECRET, {
     algorithm: "HS256",
+
     subject: user._id.toString(),
+
     issuer: TOKEN_ISSUER,
+
     audience: TOKEN_AUDIENCE,
+
     expiresIn: "2h",
   });
 }
@@ -156,7 +183,9 @@ async function protect(req, res, next) {
   try {
     payload = jwt.verify(token, process.env.JWT_SECRET, {
       algorithms: ["HS256"],
+
       issuer: TOKEN_ISSUER,
+
       audience: TOKEN_AUDIENCE,
     });
   } catch {
@@ -190,7 +219,8 @@ function adminOnly(req, res, next) {
 
 app.get("/", (req, res) => {
   res.json({
-    name: "JAMOLA API",
+    name: "NABO BEAUTY API",
+
     status: "running",
   });
 });
@@ -210,13 +240,17 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
 
   const user = await User.create({
     name,
+
     email,
+
     passwordHash,
+
     role: "customer",
   });
 
   res.status(201).json({
     user: safeUser(user),
+
     token: createToken(user),
   });
 });
@@ -236,6 +270,7 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
 
   res.json({
     user: safeUser(user),
+
     token: createToken(user),
   });
 });
@@ -248,59 +283,130 @@ app.get("/api/auth/me", protect, (req, res) => {
   });
 });
 
+/* Catalog helpers: search, filtering, sorting and pagination */
+
+// Query parsing is deliberately strict: reject arrays, objects and invalid numbers.
+const CATEGORIES = ["Eyes", "Lips", "Face", "Nails", "Skincare", "Fragrance"];
+const SORTS = {
+  featured: { catalogId: 1, createdAt: -1, _id: 1 },
+  low: { price: 1, _id: 1 },
+  high: { price: -1, _id: 1 },
+  name: { name: 1, _id: 1 },
+};
+
+function bad(message) {
+  throw Object.assign(new Error(message), { status: 400 });
+}
+
+function scalar(query, key, fallback = "") {
+  const value = query[key];
+  if (value === undefined) return fallback;
+  if (typeof value !== "string") bad(`${key} must be a single value.`);
+  return value.trim();
+}
+
+function integer(value, label, min, max) {
+  if (!/^\d+$/.test(value)) bad(`${label} must be an integer.`);
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < min || number > max) {
+    bad(`${label} must be between ${min} and ${max}.`);
+  }
+  return number;
+}
+
+function parseCatalogQuery(query) {
+  const legacyRequest = query.page === undefined && query.limit === undefined;
+  const page = integer(scalar(query, "page", "1"), "page", 1, 100000);
+  const limit = integer(
+    scalar(query, "limit", legacyRequest ? "200" : "12"),
+    "limit",
+    1,
+    legacyRequest ? 200 : 48,
+  );
+  const search = scalar(query, "search");
+  if (search.length > 100) bad("Search is limited to 100 characters.");
+  const category = scalar(query, "category", "All") || "All";
+  if (category !== "All" && !CATEGORIES.includes(category))
+    bad("Invalid category.");
+  const sort = scalar(query, "sort", "featured");
+  if (!Object.hasOwn(SORTS, sort)) bad("Invalid sort option.");
+  const inStock = scalar(query, "inStock", "false");
+  if (!["true", "false"].includes(inStock))
+    bad("inStock must be true or false.");
+  const minimum = scalar(query, "minPrice");
+  const maximum = scalar(query, "maxPrice");
+  const minPrice =
+    minimum === "" ? null : integer(minimum, "minPrice", 0, 1000000000);
+  const maxPrice =
+    maximum === "" ? null : integer(maximum, "maxPrice", 0, 1000000000);
+  if (minPrice !== null && maxPrice !== null && minPrice > maxPrice) {
+    bad("Minimum price cannot exceed maximum price.");
+  }
+  const filter = { active: true };
+  if (category !== "All") filter.category = category;
+  if (inStock === "true") filter.stock = { $gt: 0 };
+  if (minPrice !== null || maxPrice !== null) {
+    filter.price = {};
+    if (minPrice !== null) filter.price.$gte = minPrice;
+    if (maxPrice !== null) filter.price.$lte = maxPrice;
+  }
+  if (search) {
+    // Treat regex characters as ordinary text, not user supplied patterns.
+    const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    filter.$or = ["name", "brand", "category"].map((field) => ({
+      [field]: { $regex: escaped, $options: "i" },
+    }));
+  }
+  return { page, limit, filter, sort: SORTS[sort] };
+}
+
+async function listProducts(Product, query) {
+  const parsed = parseCatalogQuery(query);
+  const total = await Product.countDocuments(parsed.filter);
+  const totalPages = Math.ceil(total / parsed.limit);
+  // A saved page may disappear after products are removed. Clamp it safely.
+  const page = Math.min(parsed.page, Math.max(totalPages, 1));
+  const products = await Product.find(parsed.filter)
+    .sort(parsed.sort)
+    .skip((page - 1) * parsed.limit)
+    .limit(parsed.limit);
+  return {
+    products,
+    pagination: {
+      page,
+      limit: parsed.limit,
+      total,
+      totalPages,
+      hasNextPage: page < totalPages,
+      hasPreviousPage: total > 0 && page > 1,
+    },
+  };
+}
+
 /* Products */
 
 app.get("/api/products", async (req, res) => {
-  const filter = { active: true };
-
-  const search =
-    typeof req.query.search === "string"
-      ? req.query.search.trim().slice(0, 100)
-      : "";
-
-  const category =
-    typeof req.query.category === "string" ? req.query.category : "";
-
-  if (category && category !== "All") {
-    filter.category = category;
-  }
-
-  if (search) {
-    const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-    filter.$or = [
-      {
-        name: {
-          $regex: escaped,
-          $options: "i",
-        },
-      },
-      {
-        brand: {
-          $regex: escaped,
-          $options: "i",
-        },
-      },
-    ];
-  }
-
-  const sorts = {
-    featured: { catalogId: 1, createdAt: -1 },
-    low: { price: 1 },
-    high: { price: -1 },
-    name: { name: 1 },
-  };
-
-  const sort =
-    typeof req.query.sort === "string" && Object.hasOwn(sorts, req.query.sort)
-      ? sorts[req.query.sort]
-      : sorts.featured;
-
-  const products = await Product.find(filter).sort(sort).limit(200);
-
+  const result = await listProducts(Product, req.query);
   res.json({
-    products: products.map(productResponse),
+    products: result.products.map(productResponse),
+    pagination: result.pagination,
   });
+});
+
+/* Fetch only saved product IDs, independent of catalog pages or filters. */
+app.get("/api/products/lookup", async (req, res) => {
+  const value = req.query.ids;
+  if (typeof value !== "string" || value.length > 2500) {
+    fail(400, "Provide a comma-separated product ID list.");
+  }
+  const ids = [...new Set(value.split(",").filter(Boolean))];
+  if (ids.length > 100 || ids.some((id) => !validId(id))) {
+    fail(400, "Provide up to 100 valid product IDs.");
+  }
+  const products = ids.length
+    ? await Product.find({ _id: { $in: ids }, active: true })
+    : [];
+  res.json({ products: products.map(productResponse) });
 });
 
 /* One product */
@@ -312,6 +418,7 @@ app.get("/api/products/:id", async (req, res) => {
 
   const product = await Product.findOne({
     _id: req.params.id,
+
     active: true,
   });
 
@@ -328,12 +435,16 @@ app.get("/api/products/:id", async (req, res) => {
 
 app.post("/api/orders", protect, async (req, res) => {
   const body = req.body || {};
+
   const customer = body.customer || {};
 
   const delivery = {
     name: text(customer.name),
+
     phone: text(customer.phone),
+
     city: text(customer.city),
+
     address: text(customer.address),
   };
 
@@ -352,6 +463,7 @@ app.post("/api/orders", protect, async (req, res) => {
   if (delivery.address.length < 10 || delivery.address.length > 300) {
     fail(
       400,
+
       "Address must contain 10 to 300 characters. Include your area, street and nearest landmark.",
     );
   }
@@ -386,6 +498,7 @@ app.post("/api/orders", protect, async (req, res) => {
 
   const products = await Product.find({
     _id: { $in: [...ids] },
+
     active: true,
   });
 
@@ -406,15 +519,20 @@ app.post("/api/orders", protect, async (req, res) => {
 
     return {
       product: product._id,
+
       name: product.name,
+
       image: product.image,
+
       price: product.price,
+
       quantity: item.quantity,
     };
   });
 
   const subtotal = items.reduce(
     (sum, item) => sum + item.price * item.quantity,
+
     0,
   );
 
@@ -422,10 +540,15 @@ app.post("/api/orders", protect, async (req, res) => {
 
   const order = await Order.create({
     user: req.user._id,
+
     customer: delivery,
+
     items,
+
     subtotal,
+
     shipping,
+
     total: subtotal + shipping,
   });
 
@@ -440,7 +563,9 @@ app.get("/api/orders/my", protect, async (req, res) => {
   const orders = await Order.find({
     user: req.user._id,
   })
+
     .sort({ createdAt: -1 })
+
     .limit(100);
 
   res.json({
@@ -455,9 +580,13 @@ function productInput(body, partial = false) {
 
   const stringFields = {
     name: 150,
+
     brand: 100,
+
     shade: 150,
+
     badge: 50,
+
     description: 3000,
   };
 
@@ -593,9 +722,12 @@ app.patch("/api/admin/products/:id", protect, adminOnly, async (req, res) => {
 
   const product = await Product.findByIdAndUpdate(
     req.params.id,
+
     { $set: data },
+
     {
       new: true,
+
       runValidators: true,
     },
   );
@@ -618,11 +750,13 @@ app.delete("/api/admin/products/:id", protect, adminOnly, async (req, res) => {
 
   const product = await Product.findByIdAndUpdate(
     req.params.id,
+
     {
       $set: {
         active: false,
       },
     },
+
     { new: true },
   );
 
@@ -639,8 +773,11 @@ app.delete("/api/admin/products/:id", protect, adminOnly, async (req, res) => {
 
 app.get("/api/admin/orders", protect, adminOnly, async (req, res) => {
   const orders = await Order.find()
+
     .populate("user", "name email")
+
     .sort({ createdAt: -1 })
+
     .limit(100);
 
   res.json({
@@ -652,8 +789,11 @@ app.get("/api/admin/orders", protect, adminOnly, async (req, res) => {
 
 app.patch(
   "/api/admin/orders/:id/status",
+
   protect,
+
   adminOnly,
+
   async (req, res) => {
     if (!validId(req.params.id)) {
       fail(404, "Order not found.");
@@ -663,9 +803,13 @@ app.patch(
 
     const allowed = [
       "pending",
+
       "confirmed",
+
       "shipped",
+
       "delivered",
+
       "cancelled",
     ];
 
@@ -681,9 +825,13 @@ app.patch(
 
     const transitions = {
       pending: ["confirmed", "cancelled"],
+
       confirmed: ["shipped", "cancelled"],
+
       shipped: ["delivered"],
+
       delivered: [],
+
       cancelled: [],
     };
 
@@ -759,11 +907,12 @@ try {
   console.log("MongoDB connected");
 
   const server = app.listen(PORT, () => {
-    console.log(`JAMOLA API: http://localhost:${PORT}`);
+    console.log(`NABO BEAUTY API: http://localhost:${PORT}`);
   });
 
   server.on("error", (error) => {
     console.error("Server startup failed:", error.code);
+
     process.exit(1);
   });
 } catch {

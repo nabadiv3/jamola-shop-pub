@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+
 import { apiRequest } from "../api";
 
 const categories = [
@@ -13,12 +14,78 @@ const categories = [
 
 const money = (value) => `${Number(value).toLocaleString("en-US")} IQD`;
 
-function readStorage(key, fallback) {
+const DEFAULT_FILTERS = Object.freeze({
+  search: "",
+  category: "All",
+  sort: "featured",
+  page: 1,
+  pageSize: 8,
+  minPrice: "",
+  maxPrice: "",
+  inStock: false,
+});
+
+const validId = (value) =>
+  typeof value === "string" && /^[a-f\d]{24}$/i.test(value);
+
+function read(key, fallback) {
   try {
     return JSON.parse(localStorage.getItem(key)) ?? fallback;
   } catch {
     return fallback;
   }
+}
+
+function readFilters() {
+  const value = read("jamola-catalog-v2", {});
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return { ...DEFAULT_FILTERS };
+  const price = (input) =>
+    typeof input === "string" &&
+    /^\d{1,10}$/.test(input) &&
+    Number(input) <= 1000000000
+      ? input
+      : "";
+  return {
+    search: typeof value.search === "string" ? value.search.slice(0, 100) : "",
+    category: categories.includes(value.category) ? value.category : "All",
+    sort: ["featured", "low", "high", "name"].includes(value.sort)
+      ? value.sort
+      : "featured",
+    page:
+      Number.isInteger(value.page) && value.page > 0 && value.page <= 100000
+        ? value.page
+        : 1,
+    pageSize: [8, 12, 24].includes(value.pageSize) ? value.pageSize : 8,
+    minPrice: price(value.minPrice),
+    maxPrice: price(value.maxPrice),
+    inStock: value.inStock === true,
+  };
+}
+
+function readSavedCart() {
+  const saved = read("jamola-api-cart", []);
+  if (!Array.isArray(saved)) return [];
+  const unique = new Map();
+  for (const item of saved) {
+    if (
+      validId(item?.id) &&
+      Number.isInteger(item.quantity) &&
+      item.quantity >= 1 &&
+      item.quantity <= 10
+    ) {
+      unique.set(item.id, { id: item.id, quantity: item.quantity });
+    }
+    if (unique.size === 50) break;
+  }
+  return [...unique.values()];
+}
+
+function readSavedFavorites() {
+  const saved = read("jamola-api-favorites", []);
+  return Array.isArray(saved)
+    ? [...new Set(saved.filter(validId))].slice(0, 100)
+    : [];
 }
 
 function readSession() {
@@ -41,7 +108,7 @@ function ProductImage({ product }) {
   }, [product.image]);
 
   return failed ? (
-    <div className="jm-image-fallback">JAMOLA</div>
+    <div className="jm-image-fallback">NABO</div>
   ) : (
     <img
       src={product.image}
@@ -125,7 +192,7 @@ function AuthForm({ register, onSubmit }) {
     <section className="jm-auth">
       <p className="jm-eyebrow">YOUR BEAUTY SPACE</p>
 
-      <h1>{register ? "Join JAMOLA." : "Welcome back."}</h1>
+      <h1>{register ? "Join NABO." : "Welcome back."}</h1>
 
       <p>
         {register
@@ -255,33 +322,47 @@ function CheckoutForm({ user, busy, error, onSubmit }) {
 export default function App() {
   const [route, setRoute] = useState(getRoute);
   const [products, setProducts] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [requestLoading, setLoading] = useState(true);
   const [productError, setProductError] = useState("");
   const [reload, setReload] = useState(0);
 
-  const [category, setCategory] = useState("All");
-  const [search, setSearch] = useState("");
-  const [sort, setSort] = useState("featured");
-
-  const [cart, setCart] = useState(() => {
-    const saved = readStorage("jamola-api-cart", []);
-    return Array.isArray(saved)
-      ? saved.filter(
-          (item) =>
-            typeof item?.id === "string" &&
-            Number.isInteger(item.quantity) &&
-            item.quantity >= 1 &&
-            item.quantity <= 10,
-        )
-      : [];
+  const [filters, setFilters] = useState(readFilters);
+  const [debouncedFilters, setDebouncedFilters] = useState(filters);
+  const { category, search, sort } = filters;
+  const loading =
+    requestLoading || (route === "/shop" && filters !== debouncedFilters);
+  const [pagination, setPagination] = useState({
+    page: 1,
+    limit: 8,
+    total: 0,
+    totalPages: 0,
   });
+  const [cart, setCart] = useState(readSavedCart);
+  const [favorites, setFavorites] = useState(readSavedFavorites);
 
-  const [favorites, setFavorites] = useState(() => {
-    const saved = readStorage("jamola-api-favorites", []);
-    return Array.isArray(saved)
-      ? saved.filter((id) => typeof id === "string")
-      : [];
-  });
+  function updateFilters(changes) {
+    setLoading(true);
+    setProductError("");
+    setFilters((current) => ({ ...current, ...changes, page: 1 }));
+  }
+
+  function goToPage(value) {
+    setLoading(true);
+    setFilters((current) => ({ ...current, page: value }));
+    document
+      .getElementById("catalog-heading")
+      ?.scrollIntoView({ behavior: "smooth" });
+  }
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("jamola-catalog-v2", JSON.stringify(filters));
+    } catch {
+      /* storage may be unavailable */
+    }
+    const timer = setTimeout(() => setDebouncedFilters(filters), 350);
+    return () => clearTimeout(timer);
+  }, [filters]);
 
   const [session, setSession] = useState(readSession);
   const [authReady, setAuthReady] = useState(false);
@@ -346,36 +427,82 @@ export default function App() {
     return () => clearTimeout(timeout);
   }, [toast]);
 
+  // ID lookups keep saved carts/wishlists correct across pagination and refreshes.
+  const savedIds = [
+    ...new Set(
+      route === "/wishlist"
+        ? favorites
+        : ["/cart", "/checkout"].includes(route)
+          ? cart.map((item) => item.id)
+          : [],
+    ),
+  ]
+    .sort()
+    .join(",");
+
   useEffect(() => {
     const controller = new AbortController();
+    let current = true;
 
     async function loadProducts() {
       setLoading(true);
       setProductError("");
-
       try {
-        const data = await apiRequest("/products", {
-          signal: controller.signal,
-        });
-
-        if (!Array.isArray(data.products)) {
+        let data;
+        if (["/cart", "/checkout", "/wishlist"].includes(route)) {
+          data = savedIds
+            ? await apiRequest(
+                `/products/lookup?${new URLSearchParams({ ids: savedIds })}`,
+                { signal: controller.signal },
+              )
+            : { products: [] };
+        } else if (route.startsWith("/product/")) {
+          const id = route.split("/")[2];
+          const detail = await apiRequest(
+            `/products/${encodeURIComponent(id)}`,
+            { signal: controller.signal },
+          );
+          const related = await apiRequest(
+            `/products?${new URLSearchParams({ category: detail.product.category, limit: "5" })}`,
+            { signal: controller.signal },
+          );
+          data = {
+            products: [
+              detail.product,
+              ...related.products.filter(
+                (item) => item.id !== detail.product.id,
+              ),
+            ],
+          };
+        } else {
+          const query =
+            route === "/shop"
+              ? { ...debouncedFilters, limit: debouncedFilters.pageSize }
+              : { page: 1, limit: 8, sort: "featured" };
+          delete query.pageSize;
+          data = await apiRequest(`/products?${new URLSearchParams(query)}`, {
+            signal: controller.signal,
+          });
+        }
+        if (!Array.isArray(data.products))
           throw new Error("Invalid product response.");
-        }
-
+        if (!current) return;
         setProducts(data.products);
+        if (data.pagination) setPagination(data.pagination);
       } catch (error) {
-        if (error.name !== "AbortError") {
+        if (current && error.name !== "AbortError")
           setProductError(error.message);
-        }
       } finally {
-        if (!controller.signal.aborted) setLoading(false);
+        if (current) setLoading(false);
       }
     }
 
     loadProducts();
-
-    return () => controller.abort();
-  }, [reload]);
+    return () => {
+      current = false;
+      controller.abort();
+    };
+  }, [route, reload, debouncedFilters, savedIds]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -487,6 +614,11 @@ export default function App() {
       return;
     }
 
+    if (!existing && cart.length >= 50) {
+      setToast("Your bag can contain up to 50 different products.");
+      return;
+    }
+
     setCart((current) => {
       const found = current.find((item) => item.id === product.id);
 
@@ -525,6 +657,10 @@ export default function App() {
   }
 
   function toggleFavorite(id) {
+    if (!favorites.includes(id) && favorites.length >= 100) {
+      setToast("Your wishlist can contain up to 100 products.");
+      return;
+    }
     setFavorites((current) =>
       current.includes(id)
         ? current.filter((value) => value !== id)
@@ -533,8 +669,7 @@ export default function App() {
   }
 
   function chooseCategory(value) {
-    setCategory(value);
-    setSearch("");
+    updateFilters({ category: value, search: "" });
     window.location.hash = "/shop";
   }
 
@@ -671,21 +806,6 @@ export default function App() {
     );
   }
 
-  const filteredProducts = products
-    .filter(
-      (product) =>
-        (category === "All" || product.category === category) &&
-        `${product.name} ${product.brand} ${product.category}`
-          .toLowerCase()
-          .includes(search.trim().toLowerCase()),
-    )
-    .sort((a, b) => {
-      if (sort === "low") return a.price - b.price;
-      if (sort === "high") return b.price - a.price;
-      if (sort === "name") return a.name.localeCompare(b.name);
-      return (a.catalogId ?? 0) - (b.catalogId ?? 0);
-    });
-
   const heroProduct =
     products.find((product) => product.catalogId === 4) || products[0];
 
@@ -696,15 +816,15 @@ export default function App() {
       <>
         <section className="jm-hero">
           <div className="jm-hero-copy">
-            <p className="jm-eyebrow">BEAUTY, YOUR WAY</p>
+            <p className="jm-eyebrow">THE EVERYDAY BEAUTY EDIT</p>
             <h1>
-              YOUR LOOK.
+              LESS ROUTINE.
               <br />
-              YOUR RULES.
+              MORE YOU.
             </h1>
             <p>
-              Discover makeup, skincare and fragrance. Find the little things
-              that feel like you.
+              Considered makeup, skincare and fragrance. Discover the essentials
+              that make every day feel a little more yours.
             </p>
 
             <a className="jm-button" href="#/shop">
@@ -713,7 +833,7 @@ export default function App() {
           </div>
 
           <div className="jm-hero-art">
-            <span className="jm-hero-word">BE YOU</span>
+            <span className="jm-hero-word">NABO</span>
 
             {heroProduct && (
               <a href={`#/product/${heroProduct.id}`}>
@@ -721,9 +841,7 @@ export default function App() {
               </a>
             )}
 
-            <span className="jm-hero-caption">
-              A LITTLE COLOR. A LOT OF CONFIDENCE.
-            </span>
+            <span className="jm-hero-caption">CURATED BEAUTY. EVERY DAY.</span>
           </div>
         </section>
 
@@ -783,20 +901,23 @@ export default function App() {
     page = (
       <section className="jm-section">
         <p className="jm-eyebrow">THE COLLECTION</p>
-        <h1>Good beauty. Great mood.</h1>
+        <h1 id="catalog-heading">Your next everyday essential.</h1>
 
         <div className="jm-toolbar">
           <input
             aria-label="Search products"
-            placeholder="Search products or brands..."
+            placeholder="Search products, brands or categories..."
+            maxLength={100}
             value={search}
-            onChange={(event) => setSearch(event.target.value)}
+            onChange={(event) => updateFilters({ search: event.target.value })}
           />
 
           <select
             aria-label="Product category"
             value={category}
-            onChange={(event) => setCategory(event.target.value)}
+            onChange={(event) =>
+              updateFilters({ category: event.target.value })
+            }
           >
             {categories.map((value) => (
               <option key={value}>{value}</option>
@@ -806,7 +927,7 @@ export default function App() {
           <select
             aria-label="Sort products"
             value={sort}
-            onChange={(event) => setSort(event.target.value)}
+            onChange={(event) => updateFilters({ sort: event.target.value })}
           >
             <option value="featured">Featured</option>
             <option value="low">Price: low to high</option>
@@ -815,11 +936,117 @@ export default function App() {
           </select>
         </div>
 
+        <div className="jm-filter-row">
+          <label>
+            Min price (IQD)
+            <input
+              type="number"
+              min="0"
+              max="1000000000"
+              step="1"
+              value={filters.minPrice}
+              onChange={(event) =>
+                updateFilters({ minPrice: event.target.value })
+              }
+              placeholder="0"
+            />
+          </label>
+          <label>
+            Max price (IQD)
+            <input
+              type="number"
+              min="0"
+              max="1000000000"
+              step="1"
+              value={filters.maxPrice}
+              onChange={(event) =>
+                updateFilters({ maxPrice: event.target.value })
+              }
+              placeholder="Any price"
+            />
+          </label>
+          <label>
+            Products per page
+            <select
+              value={filters.pageSize}
+              onChange={(event) =>
+                updateFilters({ pageSize: Number(event.target.value) })
+              }
+            >
+              <option value={8}>8</option>
+              <option value={12}>12</option>
+              <option value={24}>24</option>
+            </select>
+          </label>
+          <label className="jm-checkbox">
+            <input
+              type="checkbox"
+              checked={filters.inStock}
+              onChange={(event) =>
+                updateFilters({ inStock: event.target.checked })
+              }
+            />{" "}
+            In stock only
+          </label>
+          <button
+            className="jm-button jm-outline"
+            onClick={() => updateFilters({ ...DEFAULT_FILTERS })}
+          >
+            Reset filters
+          </button>
+        </div>
+
         {!loading && !productError && (
-          <p className="jm-muted">{filteredProducts.length} products</p>
+          <p className="jm-muted" role="status">
+            {pagination.total === 0
+              ? "No matching products"
+              : `Showing ${(pagination.page - 1) * pagination.limit + 1}–${Math.min(pagination.page * pagination.limit, pagination.total)} of ${pagination.total} products`}
+          </p>
         )}
 
-        {catalogContent(filteredProducts)}
+        <div aria-busy={loading}>{catalogContent(products)}</div>
+        {!productError && pagination.totalPages > 1 && (
+          <nav className="jm-pagination" aria-label="Product pages">
+            <button
+              disabled={loading || !pagination.hasPreviousPage}
+              onClick={() => goToPage(pagination.page - 1)}
+            >
+              ← Previous
+            </button>
+            {Array.from(
+              { length: pagination.totalPages },
+              (_, index) => index + 1,
+            )
+              .filter(
+                (number) =>
+                  number === 1 ||
+                  number === pagination.totalPages ||
+                  Math.abs(number - pagination.page) <= 2,
+              )
+              .map((number, index, list) => (
+                <span key={number}>
+                  {index > 0 && number - list[index - 1] > 1 && (
+                    <span className="jm-ellipsis">…</span>
+                  )}
+                  <button
+                    disabled={loading}
+                    aria-current={
+                      number === pagination.page ? "page" : undefined
+                    }
+                    onClick={() => goToPage(number)}
+                  >
+                    {number}
+                  </button>
+                </span>
+              ))}
+            <button
+              disabled={loading || !pagination.hasNextPage}
+              onClick={() => goToPage(pagination.page + 1)}
+            >
+              Next →
+            </button>
+          </nav>
+        )}
       </section>
     );
   } else if (route.startsWith("/product/")) {
@@ -1190,7 +1417,7 @@ export default function App() {
   } else if (route === "/about") {
     page = (
       <section className="jm-about">
-        <p className="jm-eyebrow">HELLO, WE ARE JAMOLA</p>
+        <p className="jm-eyebrow">HELLO, WE ARE NABO</p>
         <h1>Beauty should feel like you.</h1>
         <p>
           A space to discover makeup, skincare and fragrance. From everyday
@@ -1217,14 +1444,13 @@ export default function App() {
   return (
     <div className="jm-app">
       <style>{styles}</style>
-
       <div className="jm-announcement">
-        A LITTLE BEAUTY, EVERY DAY · FREE DELIVERY FROM 75,000 IQD
+        THE NABO EDIT · FREE DELIVERY FROM 75,000 IQD
       </div>
 
       <header className="jm-header">
         <a className="jm-logo" href="#/">
-          JAMOLA<span>SHOP</span>
+          NABO<span>BEAUTY</span>
         </a>
 
         <nav aria-label="Main navigation">
@@ -1257,7 +1483,7 @@ export default function App() {
       <footer className="jm-footer">
         <div>
           <a className="jm-logo" href="#/">
-            JAMOLA<span>SHOP</span>
+            NABO<span>BEAUTY</span>
           </a>
 
           <p>Your everyday beauty destination.</p>
@@ -1277,7 +1503,7 @@ export default function App() {
           <a href="#/cart">Shopping bag</a>
         </div>
 
-        <p className="jm-copyright">© {new Date().getFullYear()} JAMOLA SHOP</p>
+        <p className="jm-copyright">© {new Date().getFullYear()} NABO BEAUTY</p>
       </footer>
 
       {toast && (
@@ -1289,32 +1515,62 @@ export default function App() {
   );
 }
 
-const styles = `
-.jm-app {
-  --pink: #f5bfd1;
-  --ink: #171717;
+const styles = `.jm-app {
+  --pink: #b77958;
+  --ink: #142d3d;
   color: var(--ink);
-  background: #fff;
+  background: #fffdf8;
   font-family: Arial, Helvetica, sans-serif;
   font-size: 15px;
   line-height: 1.6;
   text-align: left;
   min-height: 100vh;
 }
-body { margin: 0; }
-#root { width: 100%; max-width: none; margin: 0; padding: 0; }
-.jm-app *, .jm-app *::before, .jm-app *::after {
+body {
+  margin: 0;
+}
+#root {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+}
+.jm-app *,
+.jm-app *::before,
+.jm-app *::after {
   box-sizing: border-box;
 }
-.jm-app a { color: inherit; text-decoration: none; }
-.jm-app button, .jm-app input, .jm-app select,
-.jm-app textarea { font: inherit; }
-.jm-app button, .jm-app a { -webkit-tap-highlight-color: transparent; }
-.jm-app button { cursor: pointer; }
-.jm-app button:disabled { opacity: .45; cursor: not-allowed; }
-.jm-app img { display: block; max-width: 100%; }
-.jm-app h1, .jm-app h2, .jm-app h3,
-.jm-app p { margin-top: 0; }
+.jm-app a {
+  color: inherit;
+  text-decoration: none;
+}
+.jm-app button,
+.jm-app input,
+.jm-app select,
+.jm-app textarea {
+  font: inherit;
+}
+.jm-app button,
+.jm-app a {
+  -webkit-tap-highlight-color: transparent;
+}
+.jm-app button {
+  cursor: pointer;
+}
+.jm-app button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.jm-app img {
+  display: block;
+  max-width: 100%;
+}
+.jm-app h1,
+.jm-app h2,
+.jm-app h3,
+.jm-app p {
+  margin-top: 0;
+}
 .jm-app h1 {
   font-size: clamp(36px, 5vw, 64px);
   letter-spacing: -2px;
@@ -1357,7 +1613,8 @@ body { margin: 0; }
   margin-top: 7px;
   padding-left: 3px;
 }
-.jm-header nav, .jm-header-actions {
+.jm-header nav,
+.jm-header-actions {
   display: flex;
   align-items: center;
   gap: 24px;
@@ -1369,8 +1626,9 @@ body { margin: 0; }
   padding: 0;
   color: inherit;
 }
-.jm-header a:hover, .jm-footer a:hover {
-  opacity: .65;
+.jm-header a:hover,
+.jm-footer a:hover {
+  opacity: 0.65;
 }
 .jm-bag-link span {
   display: inline-grid;
@@ -1390,7 +1648,7 @@ body { margin: 0; }
 }
 .jm-hero-copy {
   padding: 80px 10%;
-  background: #f7f5f1;
+  background: #eeebe3;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -1405,7 +1663,7 @@ body { margin: 0; }
 .jm-hero h1 {
   font-size: clamp(48px, 6.4vw, 100px);
   font-weight: 900;
-  line-height: .95;
+  line-height: 0.95;
   letter-spacing: -5px;
 }
 .jm-hero-copy > p:not(.jm-eyebrow) {
@@ -1416,7 +1674,7 @@ body { margin: 0; }
 .jm-hero-art {
   position: relative;
   overflow: hidden;
-  background: #edb4c8;
+  background: #cbd5d0;
   display: grid;
   place-items: center;
   min-height: 430px;
@@ -1435,7 +1693,7 @@ body { margin: 0; }
 }
 .jm-hero-word {
   position: absolute;
-  color: #ffffff65;
+  color: #fffdf85c;
   font-size: clamp(90px, 12vw, 190px);
   font-weight: 900;
   white-space: nowrap;
@@ -1463,13 +1721,19 @@ body { margin: 0; }
   font-weight: bold;
   min-height: 47px;
 }
-.jm-button:hover { background: #353535; }
+.jm-button:hover {
+  background: #353535;
+}
 .jm-outline {
   background: transparent;
   color: var(--ink) !important;
 }
-.jm-outline:hover { background: #f3f3f3; }
-.jm-full { width: 100%; }
+.jm-outline:hover {
+  background: #f3f3f3;
+}
+.jm-full {
+  width: 100%;
+}
 .jm-benefits {
   display: flex;
   justify-content: space-around;
@@ -1478,7 +1742,9 @@ body { margin: 0; }
   border-bottom: 1px solid #e8e8e8;
   font-size: 11px;
 }
-.jm-section { padding: 65px 5%; }
+.jm-section {
+  padding: 65px 5%;
+}
 .jm-heading {
   display: flex;
   align-items: center;
@@ -1486,8 +1752,12 @@ body { margin: 0; }
   gap: 20px;
   margin-bottom: 28px;
 }
-.jm-heading h2 { margin-bottom: 0; }
-.jm-heading .jm-eyebrow { margin-bottom: 12px; }
+.jm-heading h2 {
+  margin-bottom: 0;
+}
+.jm-heading .jm-eyebrow {
+  margin-bottom: 12px;
+}
 .jm-heading > a {
   font-size: 12px;
   border-bottom: 1px solid;
@@ -1508,18 +1778,26 @@ body { margin: 0; }
   gap: 10px;
   color: var(--ink);
 }
-.jm-categories button:nth-child(even) { background: #f7e4eb; }
-.jm-categories button span { font-size: 10px; }
-.jm-categories button strong { font-size: 13px; }
+.jm-categories button:nth-child(even) {
+  background: #e8ddd0;
+}
+.jm-categories button span {
+  font-size: 10px;
+}
+.jm-categories button strong {
+  font-size: 13px;
+}
 .jm-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 35px 22px;
 }
-.jm-card { min-width: 0; }
+.jm-card {
+  min-width: 0;
+}
 .jm-card-image {
   position: relative;
-  background: #f6f5f3;
+  background: #eeece6;
   aspect-ratio: 1 / 1.12;
   overflow: hidden;
 }
@@ -1533,9 +1811,11 @@ body { margin: 0; }
   padding: 25px;
   object-fit: contain;
   mix-blend-mode: multiply;
-  transition: transform .25s ease;
+  transition: transform 0.25s ease;
 }
-.jm-card-image:hover img { transform: scale(1.07); }
+.jm-card-image:hover img {
+  transform: scale(1.07);
+}
 .jm-heart {
   position: absolute;
   right: 12px;
@@ -1552,7 +1832,9 @@ body { margin: 0; }
   place-items: center;
   padding: 0;
 }
-.jm-heart.selected { color: #b83263; }
+.jm-heart.selected {
+  color: #a65d3f;
+}
 .jm-badge {
   position: absolute;
   left: 12px;
@@ -1564,7 +1846,9 @@ body { margin: 0; }
   text-transform: uppercase;
   letter-spacing: 1px;
 }
-.jm-card-body { padding: 17px 0 0; }
+.jm-card-body {
+  padding: 17px 0 0;
+}
 .jm-card-body small {
   font-size: 9px;
   color: #777;
@@ -1576,7 +1860,10 @@ body { margin: 0; }
   margin: 7px 0;
   min-height: 42px;
 }
-.jm-shade { color: #888; font-size: 11px; }
+.jm-shade {
+  color: #888;
+  font-size: 11px;
+}
 .jm-price {
   display: flex;
   align-items: center;
@@ -1585,37 +1872,60 @@ body { margin: 0; }
   margin: 14px 0 18px;
   font-size: 13px;
 }
-.jm-price del { color: #999; font-size: 11px; }
-.jm-card .jm-button { min-height: 40px; padding: 9px; }
+.jm-price del {
+  color: #999;
+  font-size: 11px;
+}
+.jm-card .jm-button {
+  min-height: 40px;
+  padding: 9px;
+}
 .jm-banner {
   margin: 20px 5% 70px;
   padding: 60px 30px;
-  background: #f2dce5;
+  background: #dce3dd;
   text-align: center;
 }
-.jm-banner h2 { font-size: clamp(28px, 4vw, 50px); }
-.jm-banner > p:not(.jm-eyebrow) { color: #65515a; }
+.jm-banner h2 {
+  font-size: clamp(28px, 4vw, 50px);
+}
+.jm-banner > p:not(.jm-eyebrow) {
+  color: #65515a;
+}
 .jm-toolbar {
   display: flex;
   gap: 12px;
   margin: 30px 0 18px;
 }
-.jm-toolbar input { flex: 1; min-width: 0; }
-.jm-toolbar input, .jm-toolbar select,
-.jm-form input, .jm-form textarea {
+.jm-toolbar input {
+  flex: 1;
+  min-width: 0;
+}
+.jm-toolbar input,
+.jm-toolbar select,
+.jm-form input,
+.jm-form textarea {
   padding: 13px 14px;
   border: 1px solid #ddd;
   border-radius: 0;
   background: white;
   color: var(--ink);
 }
-.jm-muted { color: #777; font-size: 13px; }
+.jm-muted {
+  color: #777;
+  font-size: 13px;
+}
 .jm-empty {
   text-align: center;
   padding: 90px 20px;
 }
-.jm-empty > a:not(.jm-button) { text-decoration: underline; }
-.jm-error { color: #b4233a; font-size: 13px; }
+.jm-empty > a:not(.jm-button) {
+  text-decoration: underline;
+}
+.jm-error {
+  color: #b4233a;
+  font-size: 13px;
+}
 .jm-image-fallback {
   height: 100%;
   min-height: 150px;
@@ -1632,7 +1942,9 @@ body { margin: 0; }
   gap: 65px;
   margin: 30px 0 80px;
 }
-.jm-detail-image { background: #f6f5f3; }
+.jm-detail-image {
+  background: #eeece6;
+}
 .jm-detail-image img {
   width: 100%;
   height: 540px;
@@ -1640,8 +1952,12 @@ body { margin: 0; }
   padding: 35px;
   mix-blend-mode: multiply;
 }
-.jm-detail-price { font-size: 25px; }
-.jm-detail-price del { font-size: 16px; }
+.jm-detail-price {
+  font-size: 25px;
+}
+.jm-detail-price del {
+  font-size: 16px;
+}
 .jm-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1654,7 +1970,9 @@ body { margin: 0; }
   margin: 25px 0;
   font-size: 12px;
 }
-.jm-note p { margin-bottom: 8px; }
+.jm-note p {
+  margin-bottom: 8px;
+}
 .jm-two-columns {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 340px;
@@ -1668,16 +1986,26 @@ body { margin: 0; }
   padding: 23px 0;
   border-bottom: 1px solid #eee;
 }
-.jm-cart-image { background: #f6f5f3; }
+.jm-cart-image {
+  background: #eeece6;
+}
 .jm-cart-image img {
   width: 105px;
   height: 130px;
   object-fit: contain;
   padding: 10px;
 }
-.jm-cart-row small { font-size: 9px; color: #888; }
-.jm-cart-row h3 { font-size: 15px; margin: 5px 0; }
-.jm-cart-row p { font-size: 12px; }
+.jm-cart-row small {
+  font-size: 9px;
+  color: #888;
+}
+.jm-cart-row h3 {
+  font-size: 15px;
+  margin: 5px 0;
+}
+.jm-cart-row p {
+  font-size: 12px;
+}
 .jm-quantity {
   display: inline-flex;
   align-items: center;
@@ -1710,8 +2038,13 @@ body { margin: 0; }
   font-size: 11px;
   text-decoration: underline;
 }
-.jm-summary { padding: 28px; background: #f7f5f2; }
-.jm-summary h2 { font-size: 23px; }
+.jm-summary {
+  padding: 28px;
+  background: #eeebe3;
+}
+.jm-summary h2 {
+  font-size: 23px;
+}
 .jm-summary p {
   display: flex;
   justify-content: space-between;
@@ -1729,31 +2062,55 @@ body { margin: 0; }
   font-size: 10px;
   margin: 20px 0;
 }
-.jm-form { display: grid; gap: 18px; }
+.jm-form {
+  display: grid;
+  gap: 18px;
+}
 .jm-form label {
   display: grid;
   gap: 7px;
   font-size: 12px;
   font-weight: bold;
 }
-.jm-form textarea { resize: vertical; }
-.jm-form .jm-note { margin: 0; }
+.jm-form textarea {
+  resize: vertical;
+}
+.jm-form .jm-note {
+  margin: 0;
+}
 .jm-auth {
   width: min(460px, 90%);
   margin: 75px auto;
 }
-.jm-auth h1 { font-size: 45px; }
-.jm-auth > p:not(.jm-eyebrow) { color: #777; font-size: 13px; }
-.jm-auth .jm-form { margin: 30px 0; }
-.jm-auth > p a { color: #222; text-decoration: underline; }
-.jm-account { background: #f7f5f2; padding: 35px; }
+.jm-auth h1 {
+  font-size: 45px;
+}
+.jm-auth > p:not(.jm-eyebrow) {
+  color: #777;
+  font-size: 13px;
+}
+.jm-auth .jm-form {
+  margin: 30px 0;
+}
+.jm-auth > p a {
+  color: #222;
+  text-decoration: underline;
+}
+.jm-account {
+  background: #eeebe3;
+  padding: 35px;
+}
 .jm-order {
   border: 1px solid #e4e4e4;
   padding: 28px;
   margin-bottom: 22px;
 }
-.jm-order .jm-heading { margin-bottom: 20px; }
-.jm-order .jm-muted { margin: 5px 0 0; }
+.jm-order .jm-heading {
+  margin-bottom: 20px;
+}
+.jm-order .jm-muted {
+  margin: 5px 0 0;
+}
 .jm-order-item {
   display: flex;
   justify-content: space-between;
@@ -1762,16 +2119,18 @@ body { margin: 0; }
   font-size: 13px;
 }
 .jm-status {
-  background: #f8e1ea;
+  background: #dce3dd;
   padding: 5px 13px;
   font-size: 11px;
   text-transform: capitalize;
 }
-.jm-success .jm-actions { justify-content: center; }
+.jm-success .jm-actions {
+  justify-content: center;
+}
 .jm-success-icon {
   display: inline-grid;
   place-items: center;
-  background: #f5dbe6;
+  background: #dce3dd;
   border-radius: 50%;
   width: 65px;
   height: 65px;
@@ -1789,20 +2148,29 @@ body { margin: 0; }
   margin: 30px 0;
 }
 .jm-footer {
-  background: #171717;
+  background: #142d3d;
   color: white;
   padding: 55px 5% 25px;
   display: grid;
   grid-template-columns: 2fr 1fr 1fr;
   gap: 35px;
 }
-.jm-footer > div { display: flex; flex-direction: column; gap: 12px; }
-.jm-footer .jm-logo { align-self: flex-start; }
-.jm-footer p, .jm-footer div > a:not(.jm-logo) {
+.jm-footer > div {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.jm-footer .jm-logo {
+  align-self: flex-start;
+}
+.jm-footer p,
+.jm-footer div > a:not(.jm-logo) {
   font-size: 12px;
   color: #aaa;
 }
-.jm-footer strong { font-size: 13px; }
+.jm-footer strong {
+  font-size: 13px;
+}
 .jm-copyright {
   grid-column: 1 / -1;
   border-top: 1px solid #333;
@@ -1815,7 +2183,7 @@ body { margin: 0; }
   bottom: 25px;
   left: 50%;
   transform: translateX(-50%);
-  background: #171717;
+  background: #142d3d;
   color: white;
   padding: 15px 24px;
   max-width: 90vw;
@@ -1825,53 +2193,263 @@ body { margin: 0; }
   text-align: center;
 }
 @media (max-width: 1000px) {
-  .jm-header { flex-wrap: wrap; gap: 20px; }
+  .jm-header {
+    flex-wrap: wrap;
+    gap: 20px;
+  }
   .jm-header nav {
     order: 3;
     width: 100%;
     justify-content: center;
   }
-  .jm-categories { grid-template-columns: repeat(3, 1fr); }
-  .jm-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .jm-two-columns { gap: 25px; grid-template-columns: 1fr 300px; }
-  .jm-product-detail { gap: 30px; }
+  .jm-categories {
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .jm-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .jm-two-columns {
+    gap: 25px;
+    grid-template-columns: 1fr 300px;
+  }
+  .jm-product-detail {
+    gap: 30px;
+  }
 }
 @media (max-width: 700px) {
-  .jm-announcement { font-size: 8px; letter-spacing: 1px; }
-  .jm-header { padding: 20px 5%; }
-  .jm-logo { font-size: 25px; }
-  .jm-header-actions { gap: 14px; font-size: 11px; }
-  .jm-header nav { gap: 20px; font-size: 11px; }
-  .jm-hero { grid-template-columns: 1fr; }
-  .jm-hero-copy { padding: 50px 7%; }
-  .jm-hero h1 { font-size: 66px; letter-spacing: -3px; }
-  .jm-hero-art { min-height: 330px; }
-  .jm-hero-art img { height: 300px; }
-  .jm-hero-word { transform: none; font-size: 100px; }
-  .jm-benefits { flex-wrap: wrap; gap: 8px 20px; font-size: 9px; }
-  .jm-section { padding: 40px 5%; }
-  .jm-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 25px 12px; }
-  .jm-card-image img { padding: 15px; }
-  .jm-card h3 { font-size: 13px; min-height: 37px; }
-  .jm-card-body small { font-size: 8px; }
-  .jm-card .jm-price { font-size: 11px; gap: 6px; }
-  .jm-card .jm-price del { font-size: 9px; }
-  .jm-badge { font-size: 7px; left: 7px; top: 9px; padding: 3px 5px; }
-  .jm-heart { right: 7px; top: 7px; width: 27px; height: 27px; font-size: 20px; }
-  .jm-categories button { padding: 16px 10px; gap: 5px; }
-  .jm-categories button strong { font-size: 11px; }
-  .jm-categories button span:first-child { display: none; }
-  .jm-toolbar { flex-wrap: wrap; }
-  .jm-toolbar input { flex-basis: 100%; }
-  .jm-toolbar select { flex: 1; min-width: 0; font-size: 12px; }
-  .jm-two-columns, .jm-product-detail { grid-template-columns: 1fr; }
-  .jm-detail-image img { height: 350px; }
-  .jm-product-detail { margin-bottom: 50px; }
-  .jm-cart-row { grid-template-columns: 75px 1fr; gap: 15px; }
-  .jm-cart-image img { width: 75px; height: 110px; }
-  .jm-cart-end { grid-column: 2; flex-direction: row; }
-  .jm-footer { grid-template-columns: 1fr 1fr; }
-  .jm-footer > div:first-child { grid-column: 1 / -1; }
-  .jm-order { padding: 18px; }
+  .jm-announcement {
+    font-size: 8px;
+    letter-spacing: 1px;
+  }
+  .jm-header {
+    padding: 20px 5%;
+  }
+  .jm-logo {
+    font-size: 25px;
+  }
+  .jm-header-actions {
+    gap: 14px;
+    font-size: 11px;
+  }
+  .jm-header nav {
+    gap: 20px;
+    font-size: 11px;
+  }
+  .jm-hero {
+    grid-template-columns: 1fr;
+  }
+  .jm-hero-copy {
+    padding: 50px 7%;
+  }
+  .jm-hero h1 {
+    font-size: 66px;
+    letter-spacing: -3px;
+  }
+  .jm-hero-art {
+    min-height: 330px;
+  }
+  .jm-hero-art img {
+    height: 300px;
+  }
+  .jm-hero-word {
+    transform: none;
+    font-size: 100px;
+  }
+  .jm-benefits {
+    flex-wrap: wrap;
+    gap: 8px 20px;
+    font-size: 9px;
+  }
+  .jm-section {
+    padding: 40px 5%;
+  }
+  .jm-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 25px 12px;
+  }
+  .jm-card-image img {
+    padding: 15px;
+  }
+  .jm-card h3 {
+    font-size: 13px;
+    min-height: 37px;
+  }
+  .jm-card-body small {
+    font-size: 8px;
+  }
+  .jm-card .jm-price {
+    font-size: 11px;
+    gap: 6px;
+  }
+  .jm-card .jm-price del {
+    font-size: 9px;
+  }
+  .jm-badge {
+    font-size: 7px;
+    left: 7px;
+    top: 9px;
+    padding: 3px 5px;
+  }
+  .jm-heart {
+    right: 7px;
+    top: 7px;
+    width: 27px;
+    height: 27px;
+    font-size: 20px;
+  }
+  .jm-categories button {
+    padding: 16px 10px;
+    gap: 5px;
+  }
+  .jm-categories button strong {
+    font-size: 11px;
+  }
+  .jm-categories button span:first-child {
+    display: none;
+  }
+  .jm-toolbar {
+    flex-wrap: wrap;
+  }
+  .jm-toolbar input {
+    flex-basis: 100%;
+  }
+  .jm-toolbar select {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+  }
+  .jm-two-columns,
+  .jm-product-detail {
+    grid-template-columns: 1fr;
+  }
+  .jm-detail-image img {
+    height: 350px;
+  }
+  .jm-product-detail {
+    margin-bottom: 50px;
+  }
+  .jm-cart-row {
+    grid-template-columns: 75px 1fr;
+    gap: 15px;
+  }
+  .jm-cart-image img {
+    width: 75px;
+    height: 110px;
+  }
+  .jm-cart-end {
+    grid-column: 2;
+    flex-direction: row;
+  }
+  .jm-footer {
+    grid-template-columns: 1fr 1fr;
+  }
+  .jm-footer > div:first-child {
+    grid-column: 1 / -1;
+  }
+  .jm-order {
+    padding: 18px;
+  }
 }
+
+/* Backend-powered catalog controls */
+.jm-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 16px;
+  margin: 16px 0 24px;
+  padding: 20px;
+  background: #eeebe3;
+}
+.jm-filter-row label {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+}
+.jm-filter-row input:not([type="checkbox"]),
+.jm-filter-row select {
+  width: 150px;
+  padding: 10px;
+  background: white;
+  border: 1px solid #ddd;
+}
+.jm-filter-row .jm-checkbox {
+  display: flex;
+  align-items: center;
+  min-height: 42px;
+}
+.jm-pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 36px 0 10px;
+}
+.jm-pagination button {
+  min-width: 40px;
+  min-height: 42px;
+  padding: 8px 12px;
+  border: 1px solid #ddd;
+  background: white;
+}
+.jm-pagination button[aria-current="page"] {
+  background: #142d3d;
+  color: white;
+  border-color: #142d3d;
+}
+.jm-ellipsis {
+  padding: 0 8px;
+}
+@media (max-width: 700px) {
+  .jm-filter-row {
+    gap: 12px;
+    padding: 16px;
+  }
+  .jm-filter-row label:not(.jm-checkbox) {
+    flex: 1 1 120px;
+  }
+  .jm-filter-row input:not([type="checkbox"]),
+  .jm-filter-row select {
+    width: 100%;
+  }
+}
+
+/* NABO: editorial navy, ivory and copper */
+.jm-app { --ink: #142d3d; --pink: #b77958; background: #faf8f3; font-family: "DM Sans", Arial, sans-serif; }
+.jm-app h1, .jm-app h2 { font-family: Georgia, "Times New Roman", serif; font-weight: 400; letter-spacing: -1.6px; }
+.jm-announcement { background: #142d3d; letter-spacing: 2px; }
+.jm-header { background: #faf8f3; padding: 23px 5%; border-color: #dedfd7; }
+.jm-logo { font-family: Georgia, "Times New Roman", serif; letter-spacing: 4px; font-weight: 400; font-size: 35px; }
+.jm-logo span { font-family: Arial, sans-serif; letter-spacing: 6px; font-size: 8px; }
+.jm-header nav a, .jm-header nav button { text-transform: uppercase; letter-spacing: 1px; font-size: 10px; }
+.jm-hero { margin: 24px 3% 0; min-height: 570px; border: 1px solid #d7d9d0; }
+.jm-hero-copy { background: #eeebe3; padding: 65px 11%; }
+.jm-hero h1 { font-family: Georgia, "Times New Roman", serif; font-size: clamp(48px, 6vw, 88px); font-weight: 400; line-height: 1.03; letter-spacing: -3px; }
+.jm-hero-art { background: #cbd5d0; }
+.jm-hero-word { transform: none; bottom: 30px; font-family: Georgia, serif; font-weight: 400; letter-spacing: 15px; font-size: clamp(75px, 11vw, 165px); }
+.jm-hero-art img { transform: rotate(-8deg); padding-bottom: 35px; }
+.jm-hero-caption { color: #142d3d; }
+.jm-button { background: #142d3d; border-color: #142d3d; letter-spacing: 1px; font-size: 10px; }
+.jm-button:hover { background: #254759; }
+.jm-outline { background: transparent; }
+.jm-outline:hover { background: #e4e8e0; }
+.jm-card-image { background: #eeece6; border: 1px solid #e1e0d7; border-radius: 90px 90px 0 0; }
+.jm-card h3 { font-weight: 500; }
+.jm-card-body small { color: #935837; }
+.jm-card .jm-button { border-color: #c5cdc7; }
+.jm-heart { background: #faf8f3; color: #142d3d; }
+.jm-badge { background: #faf8f3; color: #142d3d; }
+.jm-categories button { border-bottom: 1px solid #bfc8bd; background: #eeebe3; }
+.jm-categories button:nth-child(even) { background: #e0e6df; }
+.jm-banner { background: #142d3d; color: #faf8f3; padding: 65px 25px; }
+.jm-banner > p:not(.jm-eyebrow) { color: #cbd5d0; }
+.jm-banner .jm-button { background: #bd8764; border-color: #bd8764; }
+.jm-footer { background: #142d3d; }
+.jm-footer p, .jm-footer div > a:not(.jm-logo) { color: #c2ccc5; }
+.jm-pagination button[aria-current=page] { background: #142d3d; border-color: #142d3d; }
+.jm-summary, .jm-account, .jm-filter-row { background: #eeebe3; border: 1px solid #dedfd7; }
+.jm-form input, .jm-form textarea, .jm-toolbar input, .jm-toolbar select { background: #fffdf8; }
+.jm-about { max-width: 800px; }
+@media (max-width: 700px) { .jm-hero { margin: 12px 3% 0; } .jm-hero-copy { padding: 45px 8%; } .jm-hero h1 { font-size: 57px; letter-spacing: -2px; } .jm-hero-art { min-height: 330px; } .jm-hero-word { font-size: 86px; bottom: 20px; } .jm-logo { font-size: 30px; } .jm-card-image { border-radius: 60px 60px 0 0; } }
 `;
